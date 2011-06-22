@@ -14,13 +14,13 @@
 #include <fcntl.h>
 
 #include "error.h"
-#include "sniffer.h"
+#include "fa_sniffer.h"
 #include "mask.h"
 #include "parse.h"
 #include "buffer.h"
-#include "transform.h"
 #include "locking.h"
 #include "disk.h"
+#include "transform.h"
 #include "disk_writer.h"
 #include "socket_server.h"
 
@@ -75,8 +75,11 @@ static void unlock_buffers(read_buffers_t buffers, unsigned int count)
     LOCK(buffer_lock);
     for (unsigned int i = 0; i < count; i ++)
     {
-        struct pool_entry *entry = (struct pool_entry *) (
-            (char *) buffers[i] - offsetof(struct pool_entry, buffer));
+        /* Ideally we should use the container_of() macro (from list.h) to
+         * recover the pool_entry address, but unfortunately array members
+         * behave differently enough that this just doesn't work. */
+        struct pool_entry *entry =
+            (void *) buffers[i] - offsetof(struct pool_entry, buffer);
         entry->next = buffer_pool;
         buffer_pool = entry;
     }
@@ -148,7 +151,7 @@ struct reader {
     size_t (*output_size)(unsigned int data_mask);
 
     unsigned int block_total_count;     // Range of block index
-    unsigned int decimation;            // FA samples per read sample
+    unsigned int decimation_log2;       // FA samples per read sample
     unsigned int fa_blocks_per_block;   // Index blocks per read block
     unsigned int samples_per_fa_block;  // Samples in a single FA block
 };
@@ -168,9 +171,9 @@ static void fixup_offset(
     const struct reader *reader, unsigned int ix_block,
     unsigned int *block, unsigned int *offset, uint64_t *available)
 {
-    *available /= reader->decimation;
+    *available >>= reader->decimation_log2;
     *offset =
-        *offset / reader->decimation +
+        (*offset >> reader->decimation_log2) +
         (ix_block % reader->fa_blocks_per_block) * reader->samples_per_fa_block;
     *block = ix_block / reader->fa_blocks_per_block;
 }
@@ -178,7 +181,7 @@ static void fixup_offset(
 
 /* Converts data block and offset into an index block and data offset.  Note
  * that the computed data offset is still in reader sized samples, to convert to
- * FA samples a further multiplication by reader->decimation is needed. */
+ * FA samples a further multiplication by reader->decimation_log2 is needed. */
 static void convert_data_to_index(
     const struct reader *reader,
     unsigned int data_block, unsigned int data_offset,
@@ -219,24 +222,23 @@ static bool compute_end_samples(
 {
     const struct disk_header *header = get_header();
     unsigned int end_block, end_offset;
-    uint64_t end_timestamp;
 
     bool ok =
-        timestamp_to_index(
-            end, NULL, &end_block, &end_offset, NULL, &end_timestamp)  &&
-        IF_(!all_data,
-            TEST_OK_(end < end_timestamp, "End timestamp too late"));
+        timestamp_to_end(
+            end, all_data, start_block, &end_block, &end_offset)  &&
+        TEST_OK_(start_block != end_block  ||  start_offset <= end_offset,
+            "Time range runs backwards");
     if (ok)
     {
         /* Convert the two block and offset counts into a total FA count. */
         if (end_block < start_block)
             end_block += header->major_block_count;
-        int64_t fa_samples =
-            (int64_t) header->major_sample_count * (end_block - start_block) +
+        uint64_t fa_samples =
+            (uint64_t) header->major_sample_count * (end_block - start_block) +
             end_offset - start_offset;
 
         /* Finally convert FA samples to requested samples. */
-        *samples = fa_samples / reader->decimation;
+        *samples = fa_samples >> reader->decimation_log2;
         ok = TEST_OK_(*samples > 0, "No samples in selected range");
     }
     return ok;
@@ -250,17 +252,11 @@ static bool compute_start(
     unsigned int *block, unsigned int *offset)
 {
     uint64_t available;
-    uint64_t start_timestamp;
     return
         /* Convert requested timestamp into a starting index block and FA offset
          * into that block. */
-        timestamp_to_index(
-            start, &available, ix_block, offset, &start_timestamp, NULL)  &&
-        /* Check that the start date is actually available. */
-        TEST_OK_(all_data  ||  start_timestamp <= start,
-            "Timestamp too early")  &&
+        timestamp_to_start(start, all_data, &available, ix_block, offset)  &&
         IF_(end != 0,
-            TEST_OK_(end > start, "Time range runs backwards")  &&
             compute_end_samples(
                 reader, end, *ix_block, *offset, all_data, samples))  &&
         /* Convert FA block, offset and available counts into numbers
@@ -326,7 +322,7 @@ static bool send_gaplist(
             /* The first data point needs to be adjusted so that it's the first
              * delivered data point, not the first point in the index block. */
             gap_data.data_index = 0;
-            gap_data.id_zero += data_offset * reader->decimation;
+            gap_data.id_zero += data_offset << reader->decimation_log2;
             gap_data.timestamp +=
                 (uint64_t) data_offset * data_index->duration /
                     reader->samples_per_fa_block;
@@ -558,6 +554,7 @@ static void d_write_lines(
             if (data_mask & 1)  *output++ = input[0];
             if (data_mask & 2)  *output++ = input[1];
             if (data_mask & 4)  *output++ = input[2];
+            if (data_mask & 8)  *output++ = input[3];
         }
         offset += 1;
     }
@@ -575,7 +572,7 @@ static size_t d_output_size(unsigned int data_mask)
 {
     unsigned int count =
         ((data_mask >> 0) & 1) + ((data_mask >> 1) & 1) +
-        ((data_mask >> 2) & 1);
+        ((data_mask >> 2) & 1) + ((data_mask >> 3) & 1);
     return count * FA_ENTRY_SIZE;
 }
 
@@ -584,7 +581,7 @@ static struct reader fa_reader = {
     .read_block = read_fa_block,
     .write_lines = fa_write_lines,
     .output_size = fa_output_size,
-    .decimation = 1,
+    .decimation_log2 = 0,
     .fa_blocks_per_block = 1,
 };
 
@@ -645,7 +642,7 @@ static bool parse_source(const char **string, struct read_parse *parse)
     }
     else if (read_char(string, 'D'))
     {
-        parse->data_mask = 7;       // Default to all fields if no mask
+        parse->data_mask = 15;      // Default to all fields if no mask
         if (read_char(string, 'D'))
             parse->reader = &dd_reader;
         else
@@ -653,7 +650,7 @@ static bool parse_source(const char **string, struct read_parse *parse)
         if (read_char(string, 'F'))
             return
                 parse_uint(string, &parse->data_mask)  &&
-                TEST_OK_(0 < parse->data_mask  &&  parse->data_mask <= 7,
+                TEST_OK_(0 < parse->data_mask  &&  parse->data_mask <= 15,
                     "Invalid decimated data fields: %x", parse->data_mask);
         else
             return true;
@@ -687,7 +684,7 @@ static bool parse_end(const char **string, uint64_t *end, uint64_t *samples)
     if (read_char(string, 'N'))
         return
             parse_uint64(string, samples)  &&
-            TEST_OK_(*samples > 0, "No samples requested\n");
+            TEST_OK_(*samples > 0, "No samples requested");
     else if (read_char(string, 'E'))
         return parse_time_or_seconds(string, end);
     else
@@ -699,11 +696,11 @@ static bool parse_end(const char **string, uint64_t *end, uint64_t *samples)
 static bool parse_options(const char **string, struct read_parse *parse)
 {
     parse->send_sample_count = read_char(string, 'N');
-    parse->send_all_data = read_char(string, 'A');
-    parse->timestamp = read_char(string, 'T');
-    parse->gaplist = read_char(string, 'G');
-    parse->only_contiguous = read_char(string, 'C');
-    parse->check_id0 = read_char(string, 'Z');
+    parse->send_all_data     = read_char(string, 'A');
+    parse->timestamp         = read_char(string, 'T');
+    parse->gaplist           = read_char(string, 'G');
+    parse->only_contiguous   = read_char(string, 'C');
+    parse->check_id0         = read_char(string, 'Z');
     return true;
 }
 
@@ -752,12 +749,12 @@ bool initialise_reader(const char *archive)
     fa_reader.block_total_count     = header->major_block_count;
     fa_reader.samples_per_fa_block  = header->major_sample_count;
 
-    d_reader.decimation             = header->first_decimation;
+    d_reader.decimation_log2        = header->first_decimation_log2;
     d_reader.block_total_count      = header->major_block_count;
     d_reader.samples_per_fa_block   = header->d_sample_count;
 
-    dd_reader.decimation =
-        header->first_decimation * header->second_decimation;
+    dd_reader.decimation_log2 =
+        header->first_decimation_log2 + header->second_decimation_log2;
     dd_reader.fa_blocks_per_block =
         buffer_size / sizeof(struct decimated_data) / header->dd_sample_count;
     dd_reader.block_total_count =

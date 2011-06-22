@@ -1,0 +1,29 @@
+BUGS
+
+* Server doesn't respond to subscribe request if no data currently available.
+  Should instead fail connection.
+
+    This one turns out to be a bit more tricky: in fact, a data gap *is*
+    reported normally, though the timeout on the viewer was a bit too eager.
+    The issue described only arises if the sniffer device can't be opened, this
+    probably isn't worth fixing.
+
+
+WORK IN PROGRESS
+
+* Line analyser.  Needs to work closely with fast feedback excitation, probably
+  doesn't want to be a separate IOC anymore.
+
+
+IDEAS
+
+* Experiment with SSE intrinsics, see if makes any difference to CIC speed.
+    Unlikely to be worth doing.
+
+* Compute decent filters for decimation, checking timing.
+    The current 1/10 filter is ok.
+
+* Guard against floating point exceptions.
+    Current approach is to ignore them unless -E used to enable, and -E isn't
+    safe against an overflow which can occur in the decimation filter (ringing
+    on a very large step).  This option now removed.

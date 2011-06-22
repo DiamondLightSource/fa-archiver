@@ -9,10 +9,10 @@ PROGRAM_PREFIX = fa-
 SHELL = bash
 INSTALL = install
 
-all:    # Default target comes first!
+default:    # Default target comes first!
 
 CFLAGS += -std=gnu99
-CFLAGS += -O2
+CFLAGS += -O3
 # CFLAGS += -g
 
 CFLAGS += -Werror
@@ -33,6 +33,7 @@ CFLAGS += -msse2
 CFLAGS += -mfpmath=sse
 CFLAGS += -ffast-math
 
+CPPFLAGS += -I$(DEVICE_DIR)
 CPPFLAGS += -D_GNU_SOURCE
 CPPFLAGS += -D_FILE_OFFSET_BITS=64
 CPPFLAGS += -D_FORTIFY_SOURCE=2
@@ -58,6 +59,8 @@ archiver_SRCS += transform.c        # Data transformation and access
 archiver_SRCS += reader.c           # Sniffer data readout
 archiver_SRCS += decimate.c         # Continuous data reduction
 archiver_SRCS += config_file.c      # Config file parsing
+archiver_SRCS += replay.c           # Replay canned data for debug
+archiver_SRCS += matlab.c           # For reading canned matlab data
 
 # FA archive preparation
 prepare_SRCS += prepare.c           # Command line interface
@@ -69,7 +72,7 @@ capture_SRCS += matlab.c            # Matlab header support
 
 
 BUILD_NAMES = $(patsubst %,$(PROGRAM_PREFIX)%,$(BUILD))
-all: $(BUILD_NAMES)
+default: $(BUILD_NAMES)
 
 define expand_build
 $(PROGRAM_PREFIX)$(target): $(COMMON_SRCS:.c=.o) $($(target)_SRCS:.c=.o)
@@ -88,9 +91,6 @@ include $(patsubst %.c,%.d,$(foreach target,$(BUILD),$($(target)_SRCS)))
 
 # Installation: we install all the built executables in $(SCRIPT_DIR)
 install: $(BUILD_NAMES)
-ifndef SCRIPT_DIR
-	echo >&2 Must define SCRIPT_DIR; false
-endif
 	$(INSTALL) $^ $(SCRIPT_DIR)
 
-.PHONY: all install
+.PHONY: default install

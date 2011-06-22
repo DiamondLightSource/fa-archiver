@@ -11,11 +11,11 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #include "error.h"
-#include "sniffer.h"
+#include "fa_sniffer.h"
 #include "mask.h"
-#include "transform.h"
 #include "disk.h"
 #include "parse.h"
 
@@ -42,6 +42,8 @@ static uint32_t output_block_size = 512 * K;
 static uint32_t first_decimation = 64;
 static uint32_t second_decimation = 256;
 static double sample_frequency = 10072.4;
+static bool dry_run = false;
+static bool quiet_allocate = false;
 
 static bool read_only = false;
 
@@ -59,7 +61,7 @@ static void usage(void)
 "\n"
 "The following options can be given:\n"
 "   -s:  Specify size of file.  The file will be resized to the given size\n"
-"        and filled with zeros.\n"
+"        all disk blocks allocated.  Optional if the file already exists.\n"
 "   -I:  Specify input block size for reads from FA sniffer device.  The\n"
 "        default value is %"PRIu32" bytes.\n"
 "   -O:  Specify block size for IO transfers to disk.  This should match\n"
@@ -67,6 +69,8 @@ static void usage(void)
 "   -d:  Specify first decimation factor.  The default value is %"PRIu32".\n"
 "   -D:  Specify second decimation factor.  The default value is %"PRIu32".\n"
 "   -f:  Specify nominal sample frequency.  The default is %.1gHz\n"
+"   -n   Print file header but don't actually write anything.\n"
+"   -q   Use faster but quiet mechanism for allocating file buffer.\n"
 "\n"
 "File size can be followed by one of K, M, G or T to specify sizes in\n"
 "kilo, mega, giga or terabytes, and similarly block sizes can be followed\n"
@@ -86,7 +90,7 @@ static bool process_opts(int *argc, char ***argv)
     bool ok = true;
     while (ok)
     {
-        switch (getopt(*argc, *argv, "+hs:I:O:d:D:f:"))
+        switch (getopt(*argc, *argv, "+hs:I:O:d:D:f:nq"))
         {
             case 'h':
                 usage();
@@ -115,6 +119,8 @@ static bool process_opts(int *argc, char ***argv)
                 ok = DO_PARSE("sample frequency",
                     parse_double, optarg, &sample_frequency);
                 break;
+            case 'n':   dry_run = true;                             break;
+            case 'q':   quiet_allocate = true;                      break;
             case '?':
             default:
                 fprintf(stderr, "Try `%s -h` for usage\n", argv0);
@@ -167,19 +173,26 @@ static bool reset_index(int file_fd, int index_data_size)
     return ok;
 }
 
+static bool prepare_new_header(struct disk_header *header)
+{
+    return
+        initialise_header(header,
+            &archive_mask, file_size,
+            input_block_size, output_block_size,
+            first_decimation, second_decimation, sample_frequency)  &&
+        DO_(print_header(stdout, header));
+}
+
 static bool write_new_header(int file_fd, int *written)
 {
     struct disk_header *header;
     bool ok =
         TEST_NULL(header = valloc(DISK_HEADER_SIZE))  &&
-        initialise_header(header,
-            &archive_mask, file_size,
-            input_block_size, output_block_size,
-            first_decimation, second_decimation, sample_frequency)  &&
+        DO_(memset(header, 0, DISK_HEADER_SIZE))  &&
+        prepare_new_header(header)  &&
         TEST_IO(lseek(file_fd, 0, SEEK_SET))  &&
         TEST_write(file_fd, header, DISK_HEADER_SIZE)  &&
         reset_index(file_fd, header->index_data_size)  &&
-        DO_(print_header(stdout, header))  &&
         DO_(*written = DISK_HEADER_SIZE + header->index_data_size);
     free(header);
     return ok;
@@ -199,13 +212,7 @@ static void show_progress(int n, int final_n)
 }
 
 
-/* This routine can be rewritten as simply (after removing the O_DIRECT flag on
- * the open() call below):
- *
- *  return TEST_0(posix_fallocate(file_fd, written, file_size - written));
- *
- * but there is one down side: we can't show progress for what is a very time
- * consuming operation. */
+/* Verbose and slower near equivalent to posix_fallocate(). */
 static bool fill_zeros(int file_fd, int written)
 {
     uint32_t block_size = 512*K;
@@ -238,27 +245,46 @@ int main(int argc, char **argv)
     int file_fd;
     if (read_only)
     {
-        char header[DISK_HEADER_SIZE];
+        struct disk_header header;
         ok =
             TEST_IO_(file_fd = open(file_name, O_RDONLY),
                 "Unable to read file \"%s\"", file_name)  &&
-            TEST_read(file_fd, header, DISK_HEADER_SIZE)  &&
-            DO_(print_header(stdout, (struct disk_header *) header));
+            TEST_read(file_fd, &header, sizeof(header))  &&
+            DO_(print_header(stdout, &header));
+    }
+    else if (dry_run)
+    {
+        struct disk_header header = {};
+        ok =
+            IF_(!file_size_given,
+                TEST_IO_(file_fd = open(file_name, O_RDONLY),
+                    "Unable to open archive \"%s\"", file_name)  &&
+                FINALLY(
+                    get_filesize(file_fd, &file_size),
+                    TEST_IO(close(file_fd))))  &&
+            prepare_new_header(&header);
     }
     else
     {
-        int open_flags = file_size_given ? O_CREAT | O_TRUNC : 0;
+        int open_flags =
+            (file_size_given ? O_CREAT | O_TRUNC : 0) |
+            (quiet_allocate ? 0 : O_DIRECT) | O_WRONLY;
         int written;
         ok =
-            TEST_IO_(file_fd = open(file_name,
-                O_WRONLY | O_DIRECT | open_flags, 0664),
+            TEST_IO_(file_fd = open(file_name, open_flags, 0664),
                 "Unable to write to file \"%s\"", file_name)  &&
             lock_archive(file_fd)  &&
             IF_(!file_size_given,
                 get_filesize(file_fd, &file_size))  &&
             write_new_header(file_fd, &written)  &&
             IF_(file_size_given,
-                fill_zeros(file_fd, written))  &&
+                IF_ELSE(quiet_allocate,
+                    /* posix_fallocate is marginally faster but shows no sign of
+                     * progress. */
+                    TEST_0(posix_fallocate(
+                        file_fd, written, file_size - written)),
+                    /* If we use full_zeros we can show progress to the user. */
+                    fill_zeros(file_fd, written)))  &&
             TEST_IO(close(file_fd));
     }
 

@@ -12,14 +12,14 @@
 #include <errno.h>
 
 #include "error.h"
-#include "sniffer.h"
+#include "fa_sniffer.h"
 #include "mask.h"
 #include "buffer.h"
-#include "transform.h"
 #include "disk_writer.h"
 #include "locking.h"
-
 #include "disk.h"
+
+#include "transform.h"
 
 
 // !!! should be disk header parameter
@@ -84,7 +84,7 @@ static inline struct decimated_data * d_block(unsigned int id)
 static bool advance_block(void)
 {
     fa_offset += input_frame_count;
-    d_offset += input_frame_count / header->first_decimation;
+    d_offset += input_frame_count >> header->first_decimation_log2;
     return fa_offset >= header->major_sample_count;
 }
 
@@ -163,48 +163,218 @@ static void transpose_block(const void *read_block)
 
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/* Support for variance calculation. */
+
+/* To avoid overflow and to support the incremental calculation of variance we
+ * need to use a long accumulator.  Unfortunately on 32 bit systems we have no
+ * intrinsic support for 128 bit integers, so we need some conditional
+ * compilation here.
+ *    The only operations we need are accumulation (of 64 and 128 bit
+ * intermediates) and shifting out the result. */
+
+#ifdef __i386__
+/* Only have 64 bit integers, need to emulate the 128 bit accumulator. */
+
+struct uint128 { uint64_t low; uint64_t high; };
+typedef struct uint128 uint128_t;
+
+/* It's really rather annoying, there doesn't seem to be any good way other than
+ * resorting to the assembler below to efficiently compute with 128 bit numbers.
+ * The principal problem is that the carry is inaccessible.  The alternative
+ * trick of writing:
+ *      acc->low += val; if (acc->low < val) acc->high += 1;
+ * generates horrible code.
+ *
+ * Some notes on the assembler constraints, because the documentation can be a
+ * bit opaque and some of the interactions are quite subtle:
+ *
+ *  1.  The form of the asm statement is
+ *          __asm__(<code> : <outputs> : <inputs> : <effects>)
+ *  2.  We must at least specify "m"(*acc) otherwise the code can end up being
+ *      discarded (as having no significant side effects).
+ *  3.  The "=&r"(t) output assigns a temporary register.  The & ensures that
+ *      this register doesn't overlap with any of the input registers.
+ *  4.  The register modifier = is used for an output which is written without
+ *      being read, + is used for an output which is also read. */
+
+static void accum128_64(uint128_t *acc, uint64_t val)
+{
+    __asm__(
+        "addl   %[vall], 0(%[acc])" "\n\t"
+        "adcl   %[valh], 4(%[acc])" "\n\t"
+        "adcl   $0, 8(%[acc])" "\n\t"
+        "adcl   $0, 12(%[acc])"
+        :
+        : [acc] "r" (acc), "m" (*acc),
+          [vall] "r" ((uint32_t) val), [valh] "r" ((uint32_t) (val >> 32))
+        : "cc" );
+}
+
+static void accum128_128(uint128_t *acc, const uint128_t *val)
+{
+    int t;
+    __asm__(
+        "movl   0(%[val]), %[t]" "\n\t"
+        "addl   %[t], 0(%[acc])" "\n\t"
+        "movl   4(%[val]), %[t]" "\n\t"
+        "adcl   %[t], 4(%[acc])" "\n\t"
+        "movl   8(%[val]), %[t]" "\n\t"
+        "adcl   %[t], 8(%[acc])" "\n\t"
+        "movl   12(%[val]), %[t]" "\n\t"
+        "adcl   %[t], 12(%[acc])"
+        : [t] "=&r" (t), "+m" (*acc)
+        : [acc] "r" (acc), [val] "r" (val), "m" (*val)
+        : "cc" );
+}
+
+static uint64_t sr128(uint128_t *acc, unsigned int shift)
+{
+    return (acc->low >> shift) | (acc->high << (64 - shift));
+}
+
+#else
+/* Assume built-in 128 bit integers. */
+
+typedef __uint128_t uint128_t;
+
+static void accum128_64(uint128_t *acc, uint64_t val)
+{
+    *acc += val;
+}
+
+static void accum128_128(uint128_t *acc, const uint128_t *val)
+{
+    *acc += *val;
+}
+
+static uint64_t sr128(uint128_t *acc, unsigned int shift)
+{
+    return *acc >> shift;
+}
+
+#endif
+
+
+/* The calculation of variance is really rather delicate, as it is enormously
+ * susceptible to numerical problems.  The "proper" way to compute variance is
+ * using the formula
+ *      var = SUM((x[i] - m)^2) / N   where  m = mean(x) = SUM(x[i]) / N  .
+ * This approach isn't so great when dealing with a stream of data, which we
+ * have in the case of double decimation, as we need to pass over the dataset
+ * twice.  The alternative calulcation is:
+ *      var = SUM(x[i]^2) / N - m^2  ,
+ * but this is *very* demanding on the intermediate values, particularly if the
+ * result is to be accurate when m is large.  In this application x[i] is 32
+ * bits, N maybe up to 16 bits, and so we need around 80 bits for the sum, hence
+ * the use of 128 bits for the accumulator. */
+
+static int32_t compute_std(uint128_t *acc, int64_t sum, int shift)
+{
+    /* It's sufficiently accurate and actually faster to change over to floating
+     * point arithmetic at this point. */
+    double mean = sum / (double) (1 << shift);
+    double var = sr128(acc, shift) - mean * mean;
+    /* Note that rounding errors still allow var in the range -1..0, so need to
+     * truncate these to zero. */
+    return var > 0 ? (int32_t) sqrt(var) : 0;
+}
+
+
+/* Accumulator for generating decimated data. */
+struct fa_accum {
+    int32_t minx, maxx, miny, maxy;
+    int64_t sumx, sumy;
+    uint128_t sum_sq_x, sum_sq_y;
+};
+
+static void initialise_accum(struct fa_accum *acc)
+{
+    memset(acc, 0, sizeof(struct fa_accum));
+    acc->minx = INT32_MAX;
+    acc->maxx = INT32_MIN;
+    acc->miny = INT32_MAX;
+    acc->maxy = INT32_MIN;
+}
+
+static void accum_xy(struct fa_accum *acc, const struct fa_entry *input)
+{
+    int32_t x = input->x;
+    int32_t y = input->y;
+    if (x < acc->minx)   acc->minx = x;
+    if (acc->maxx < x)   acc->maxx = x;
+    if (y < acc->miny)   acc->miny = y;
+    if (acc->maxy < y)   acc->maxy = y;
+    acc->sumx += x;
+    acc->sumy += y;
+    accum128_64(&acc->sum_sq_x, (int64_t) x * x);
+    accum128_64(&acc->sum_sq_y, (int64_t) y * y);
+}
+
+static void accum_accum(struct fa_accum *result, const struct fa_accum *input)
+{
+    if (input->minx < result->minx)   result->minx = input->minx;
+    if (result->maxx < input->maxx)   result->maxx = input->maxx;
+    if (input->miny < result->miny)   result->miny = input->miny;
+    if (result->maxy < input->maxy)   result->maxy = input->maxy;
+    result->sumx += input->sumx;
+    result->sumy += input->sumy;
+    accum128_128(&result->sum_sq_x, &input->sum_sq_x);
+    accum128_128(&result->sum_sq_y, &input->sum_sq_y);
+}
+
+static void compute_result(
+    struct fa_accum *acc, unsigned int shift, struct decimated_data *result)
+{
+    result->min.x = acc->minx;
+    result->max.x = acc->maxx;
+    result->min.y = acc->miny;
+    result->max.y = acc->maxy;
+    result->mean.x = (int32_t) (acc->sumx >> shift);
+    result->mean.y = (int32_t) (acc->sumy >> shift);
+    result->std.x = compute_std(&acc->sum_sq_x, acc->sumx, shift);
+    result->std.y = compute_std(&acc->sum_sq_y, acc->sumy, shift);
+}
+
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 /* Single data decimation. */
 
+
+/* Array of result accumulators for double decimation. */
+struct fa_accum *double_accumulators;
 
 
 /* Converts a column of N FA entries into a single entry by computing the mean,
  * min, max and standard deviation of the column. */
 static void decimate_column_one(
-    const struct fa_entry *input, struct decimated_data *output, unsigned int N)
+    const struct fa_entry *input, struct decimated_data *output,
+    struct fa_accum *double_accum, unsigned int N_log2)
 {
-    int64_t sumx = 0, sumy = 0;
-    int32_t minx = INT32_MAX, maxx = INT32_MIN;
-    int32_t miny = INT32_MAX, maxy = INT32_MIN;
-    const struct fa_entry *in = input;
-    for (unsigned int i = 0; i < N; i ++)
+    struct fa_accum accum;
+    initialise_accum(&accum);
+
+    for (unsigned int i = 0; i < 1U << N_log2; i ++)
     {
-        int32_t x = in->x;
-        int32_t y = in->y;
-        sumx += x;
-        sumy += y;
-        if (x < minx)   minx = x;
-        if (maxx < x)   maxx = x;
-        if (y < miny)   miny = y;
-        if (maxy < y)   maxy = y;
-        in += FA_ENTRY_COUNT;
+        accum_xy(&accum, input);
+        input += FA_ENTRY_COUNT;
     }
-    output->min.x = minx;    output->max.x = maxx;
-    output->min.y = miny;    output->max.y = maxy;
-    output->mean.x = (int32_t) (sumx / N);
-    output->mean.y = (int32_t) (sumy / N);
+    compute_result(&accum, N_log2, output);
+
+    accum_accum(double_accum, &accum);
 }
 
 static void decimate_column(
-    const struct fa_entry *input, struct decimated_data *output)
+    const struct fa_entry *input, struct decimated_data *output,
+    struct fa_accum *double_accums)
 {
     for (unsigned int i = 0; i < input_decimation_count; i ++)
     {
-        decimate_column_one(input, output, header->first_decimation);
-        input += header->first_decimation * FA_ENTRY_COUNT;
+        decimate_column_one(
+            input, output, double_accums, header->first_decimation_log2);
+        input += FA_ENTRY_COUNT << header->first_decimation_log2;
         output += 1;
     }
 }
-
 
 static void decimate_block(const void *read_block)
 {
@@ -213,7 +383,9 @@ static void decimate_block(const void *read_block)
     {
         if (test_mask_bit(&header->archive_mask, id))
         {
-            decimate_column(read_block + FA_ENTRY_SIZE * id, d_block(written));
+            decimate_column(
+                read_block + FA_ENTRY_SIZE * id, d_block(written),
+                &double_accumulators[written]);
             written += 1;
         }
     }
@@ -226,33 +398,7 @@ static void decimate_block(const void *read_block)
 
 /* Current offset into DD data area. */
 unsigned int dd_offset;
-
-
-/* Similar to decimate_column above, but condenses already decimated data by
- * further decimation.  In this case the algorithms are somewhat different. */
-static void decimate_decimation(
-    const struct decimated_data *input, struct decimated_data *output,
-    unsigned int N)
-{
-    int64_t sumx = 0, sumy = 0;
-    int32_t minx = INT32_MAX, maxx = INT32_MIN;
-    int32_t miny = INT32_MAX, maxy = INT32_MIN;
-    for (unsigned int i = 0; i < N; i ++, input ++)
-    {
-        sumx += input->mean.x;
-        sumy += input->mean.y;
-        if (input->min.x < minx)     minx = input->min.x;
-        if (maxx < input->max.x)     maxx = input->max.x;
-        if (input->min.y < miny)     miny = input->min.y;
-        if (maxy < input->max.y)     maxy = input->max.y;
-    }
-    output->mean.x = (int32_t) (sumx / N);
-    output->mean.y = (int32_t) (sumy / N);
-    output->min.x = minx;
-    output->max.x = maxx;
-    output->min.y = miny;
-    output->max.y = maxy;
-}
+unsigned int output_id_count;
 
 
 
@@ -260,24 +406,33 @@ static void decimate_decimation(
  * the in memory DD block. */
 static void double_decimate_block(void)
 {
-    /* Note that we look backwards in time one second_decimation block to pick
-     * up the data to be decimated here. */
-    const struct decimated_data *input = d_block(0) - header->second_decimation;
     struct decimated_data *output = dd_area + dd_offset;
+    unsigned int decimation_log2 =
+        header->first_decimation_log2 + header->second_decimation_log2;
 
-    unsigned int written = 0;
-    for (unsigned int id = 0; id < FA_ENTRY_COUNT; id ++)
+    for (unsigned int i = 0; i < output_id_count; i ++)
     {
-        if (test_mask_bit(&header->archive_mask, id))
-        {
-            decimate_decimation(input, output, header->second_decimation);
-            input += header->d_sample_count;
-            output += header->dd_total_count;
-            written += 1;
-        }
+        compute_result(&double_accumulators[i], decimation_log2, output);
+        initialise_accum(&double_accumulators[i]);
+        output += header->dd_total_count;
     }
 
     dd_offset = (dd_offset + 1) % header->dd_total_count;
+}
+
+
+static void reset_double_decimation(void)
+{
+    dd_offset = header->current_major_block * header->dd_sample_count;
+    for (unsigned int i = 0; i < output_id_count; i ++)
+        initialise_accum(&double_accumulators[i]);
+}
+
+static void initialise_double_decimation(void)
+{
+    output_id_count = count_mask_bits(&header->archive_mask);
+    double_accumulators = calloc(output_id_count, sizeof(struct fa_accum));
+    reset_double_decimation();
 }
 
 
@@ -373,23 +528,18 @@ static void initialise_index(void)
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 /* Interlocked access. */
 
-
-bool timestamp_to_index(
-    uint64_t timestamp, uint64_t *samples_available,
-    unsigned int *major_block, unsigned int *offset,
-    uint64_t *start_timestamp, uint64_t *end_timestamp)
+/* Binary search to find major block corresponding to timestamp.  Note that the
+ * high block is never inspected, which is just as well, as the current block is
+ * invariably invalid.
+ *     Returns the index of the latest valid block with a starting timestamp no
+ * later than the target timestamp.  If the archive is empty may return an
+ * invalid index, this is recognised by comparing the result with current. */
+static unsigned int binary_search(uint64_t timestamp, bool *first_block)
 {
-    bool ok;
-    LOCK(transform_lock);
-
     unsigned int N = header->major_block_count;
     unsigned int current = header->current_major_block;
-    unsigned int block_size = header->major_sample_count;
-
-    /* Binary search to find major block corresponding to timestamp.  Note that
-     * the high block is never inspected, which is just as well, as the current
-     * block is invariably invalid. */
-    unsigned int low  = (current + 1 + INDEX_SKIP) % N;
+    unsigned int start = (current + 1 + INDEX_SKIP) % N;
+    unsigned int low = start;
     unsigned int high = current;
     while ((low + 1) % N != high)
     {
@@ -404,55 +554,130 @@ bool timestamp_to_index(
             low = mid;
     }
 
-    /* Compute the offset of the selected timestamp into the current block and
-     * compensate for any block that's too early. */
-    unsigned int duration = data_index[low].duration;
-    if (duration == 0)
-    {
-        /* Fresh blocks that have never been overwritten have both duration and
-         * timestamp zero, so the next block along will be the right block. */
-        low = high;
-        *offset = 0;
-    }
-    /* The start timestamp most precede the target timestamp if possible.  */
-    if (start_timestamp != NULL)
-        *start_timestamp = data_index[low].timestamp;
+    /* To improve error reporting identify whether this is the first block. */
+    if (first_block)
+        *first_block = data_index[low].duration == 0  ||  low == start;
+    /* Blocks with zero duration represent the start of the archive, so don't
+     * return one of these.  Unless the archive is completely empty the result
+     * will still be a valid block.  We don't worry about coping with an empty
+     * archive, so long as we don't crash! */
+    return data_index[low].duration == 0 ? high : low;
+}
 
-    if (duration != 0)
-    {
-        /* Compute the offset of the timestamp into the selected block. */
-        uint64_t block_start = data_index[low].timestamp;
-        uint64_t raw_offset = (timestamp - block_start) * block_size / duration;
-        if (raw_offset >= block_size  &&  low != current)
-        {
-            /* If we fall off the end of the selected block (perhaps there's a
-             * capture gap) simply skip to the following block -- unless we're
-             * already on the last block. */
-            if (high != current)
-                low = high;
-            *offset = 0;
-        }
-        else
-            *offset = (unsigned int) raw_offset;
-    }
 
-    *major_block = low;
-    if (samples_available != NULL)
-    {
-        unsigned int block_count =
-            current >= low ? current - low : N - low + current;
-        *samples_available = (uint64_t) block_count * block_size - *offset;
-    }
-    /* If required return bounding timestamps. */
-    if (end_timestamp != NULL)
-        *end_timestamp = data_index[low].timestamp + data_index[low].duration;
-
-    /* Check that the identified block is in fact valid. */
-    ok = TEST_OK_(low != current, "Timestamp too late");
+uint64_t get_earliest_timestamp(void)
+{
+    uint64_t result;
+    LOCK(transform_lock);
+    result = data_index[binary_search(1, NULL)].timestamp;
     UNLOCK(transform_lock);
+    return result;
+}
 
+
+/* Looks up timestamp and returns the block and offset into that block of the
+ * "nearest" block.  If skip_gap is set it is possible that *block_out becomes
+ * invalid, which must be checked by comparing with header->current_major_block,
+ * but otherwise (except in the transient case of a completely empty archive)
+ * the block is guaranteed to be valid. */
+static void timestamp_to_block(
+    uint64_t timestamp, bool skip_gap, bool *first_block,
+    unsigned int *block_out, unsigned int *offset)
+{
+    unsigned int block = binary_search(timestamp, first_block);
+    uint64_t block_start = data_index[block].timestamp;
+    unsigned int duration = data_index[block].duration;
+    unsigned int block_size = header->major_sample_count;
+    if (timestamp < block_start)
+        /* Timestamp precedes block, must mean that this is the earliest block
+         * in the archive, so just start at the beginning of this block. */
+        *offset = 0;
+    else if (timestamp - block_start < duration)
+        /* The normal case, return the offset of the selected timestamp into the
+         * current block. */
+        *offset = (timestamp - block_start) * block_size / duration;
+    else if (skip_gap)
+    {
+        /* Timestamp falls off this block but precedes the next.  This will be
+         * due to a data gap which we skip.  Caller must check validity of the
+         * returned block in this case. */
+        block = (block + 1) % header->major_block_count;
+        *offset = 0;
+        if (first_block)
+            *first_block = false;
+    }
+    else
+        /* Data gap after this block but skipping disabled.  Point to the last
+         * data point in the block instead. */
+        *offset = block_size - 1;
+    *block_out = block;
+}
+
+
+/* Computes the number of samples available from the given block:offset to the
+ * current end of the archive. */
+static uint64_t compute_samples(unsigned int block, unsigned int offset)
+{
+    unsigned int current = header->current_major_block;
+    unsigned int N = header->major_block_count;
+    unsigned int block_count =
+        current >= block ? current - block : N - block + current;
+    unsigned int block_size = header->major_sample_count;
+    return (uint64_t) block_count * block_size - offset;
+}
+
+
+bool timestamp_to_start(
+    uint64_t timestamp, bool all_data, uint64_t *samples_available,
+    unsigned int *block, unsigned int *offset)
+{
+    bool ok;
+    LOCK(transform_lock);
+
+    bool first_block;
+    timestamp_to_block(timestamp, true, &first_block, block, offset);
+    ok =
+        TEST_OK_(
+            *block != header->current_major_block, "Start time too late")  &&
+        TEST_OK_(all_data  ||  data_index[*block].timestamp <= timestamp,
+            first_block ? "Start time too early" : "Start time in data gap");
+    if (ok)
+        *samples_available = compute_samples(*block, *offset);
+
+    UNLOCK(transform_lock);
     return ok;
 }
+
+
+bool timestamp_to_end(
+    uint64_t timestamp, bool all_data, unsigned int start_block,
+    unsigned int *block, unsigned int *offset)
+{
+    uint64_t end_timestamp;
+    unsigned int current;
+
+    LOCK(transform_lock);
+
+    current = header->current_major_block;
+    timestamp_to_block(timestamp, false, NULL, block, offset);
+    struct data_index *ix = &data_index[*block];
+    end_timestamp = ix->timestamp + ix->duration;
+
+    UNLOCK(transform_lock);
+
+    return
+        TEST_OK_(all_data  ||  timestamp <= end_timestamp,
+            "End time too late")  &&
+        TEST_OK_(
+            /* This test is a little tricky: checking that end comes no earlier
+             * than start, but need to take wraparound into account.
+             * Essentially can only see end below start if the gap (current
+             * block) lies inbetween. */
+            *block >= start_block  ||
+            (*block < current  &&  current < start_block),
+            "Time range runs backwards");
+}
+
 
 
 bool find_gap(bool check_id0, unsigned int *start, unsigned int *blocks)
@@ -512,8 +737,9 @@ void process_block(const void *block, uint64_t timestamp)
         transpose_block(block);
         decimate_block(block);
         bool must_write = advance_block();
-        if (fa_offset % (
-                header->first_decimation * header->second_decimation) == 0)
+        unsigned int decimation = 1 << (
+            header->first_decimation_log2 + header->second_decimation_log2);
+        if ((fa_offset & (decimation - 1)) == 0)
             double_decimate_block();
         if (must_write)
         {
@@ -529,12 +755,12 @@ void process_block(const void *block, uint64_t timestamp)
          * far. */
         reset_block();
         reset_index();
-        dd_offset = header->current_major_block * header->dd_sample_count;
+        reset_double_decimation();
     }
 }
 
 
-bool initialise_transform(
+void initialise_transform(
     struct disk_header *header_, struct data_index *data_index_,
     struct decimated_data *dd_area_)
 {
@@ -542,10 +768,9 @@ bool initialise_transform(
     data_index = data_index_;
     dd_area = dd_area_;
     input_frame_count = header->input_block_size / FA_FRAME_SIZE;
-    input_decimation_count = input_frame_count / header->first_decimation;
-    dd_offset = header->current_major_block * header->dd_sample_count;
+    input_decimation_count = input_frame_count >> header->first_decimation_log2;
 
+    initialise_double_decimation();
     initialise_io_buffer();
     initialise_index();
-    return true;
 }

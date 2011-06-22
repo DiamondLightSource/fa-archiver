@@ -1,0 +1,9 @@
+#!/bin/sh
+
+# Runs the FA archiver for the storage ring.  This runs on fa-archiver server.
+
+ARCHIVE_FILE=/dev/mapper/vg2-sniffer1
+ARCHIVE_ARGS='-X -c filters/decimate.config'
+
+cd "$(dirname "$0")"/..
+exec build/$(uname -m)/fa-archiver $ARCHIVE_ARGS "$ARCHIVE_FILE"

@@ -17,10 +17,10 @@
 
 #include "error.h"
 #include "buffer.h"
-#include "sniffer.h"
+#include "fa_sniffer.h"
 #include "mask.h"
-#include "transform.h"
 #include "disk.h"
+#include "transform.h"
 #include "locking.h"
 
 #include "disk_writer.h"
@@ -71,11 +71,15 @@ bool initialise_disk_writer(const char *file_name, uint32_t *input_block_size)
         TEST_IO(
             dd_data = mmap(NULL, header->dd_data_size,
                 PROT_READ | PROT_WRITE, MAP_SHARED, disk_fd,
-                header->dd_data_start));
+                header->dd_data_start))  &&
+        DO_(initialise_transform(header, data_index, dd_data));
 }
 
 static void close_disk(void)
 {
+    ASSERT_IO(msync(dd_data, header->dd_data_size, MS_ASYNC));
+    ASSERT_IO(msync(data_index, header->index_data_size, MS_ASYNC));
+    ASSERT_IO(msync(header, DISK_HEADER_SIZE, MS_ASYNC));
     ASSERT_IO(munmap(dd_data, header->dd_data_size));
     ASSERT_IO(munmap(data_index, header->index_data_size));
     ASSERT_IO(munmap(header, DISK_HEADER_SIZE));
@@ -99,17 +103,34 @@ static off64_t writing_offset;
 static void *writing_block;
 static size_t writing_length;
 
+
+/* Ensures entire block is written even if interrupted. */
+static bool do_write(int file, void *buffer, size_t length)
+{
+    while (length > 0)
+    {
+        ssize_t tx;
+        if (!TEST_OK(tx = write(file, buffer, length)))
+            return false;
+        length -= tx;
+        buffer += tx;
+    }
+    return true;
+}
+
 static void * writer_thread(void *context)
 {
-    while (writer_running)
+    bool ok = true;
+    while (ok  &&  writer_running)
     {
         LOCK(writer_lock);
-        while (!writing_active)
+        while (writer_running  &&  !writing_active)
             pwait(&writer_lock);
         UNLOCK(writer_lock);
 
-        ASSERT_IO(lseek(disk_fd, writing_offset, SEEK_SET));
-        ASSERT_write(disk_fd, writing_block, writing_length);
+        ok = writing_active  &&
+            TEST_IO(lseek(disk_fd, writing_offset, SEEK_SET))  &&
+            do_write(disk_fd, writing_block, writing_length);
 
         LOCK(writer_lock);
         writing_active = false;
@@ -117,6 +138,14 @@ static void * writer_thread(void *context)
         UNLOCK(writer_lock);
     }
     return NULL;
+}
+
+static void stop_writer_thread(void)
+{
+    LOCK(writer_lock);
+    writer_running = false;
+    psignal(&writer_lock);
+    UNLOCK(writer_lock);
 }
 
 void schedule_write(off64_t offset, void *block, size_t length)
@@ -173,7 +202,6 @@ bool start_disk_writer(struct buffer *buffer)
     reader = open_reader(buffer, true);
     writer_running = true;
     return
-        initialise_transform(header, data_index, dd_data)  &&
         TEST_0(pthread_create(&writer_id, NULL, writer_thread, NULL))  &&
         TEST_0(pthread_create(&transform_id, NULL, transform_thread, NULL));
 }
@@ -182,9 +210,7 @@ bool start_disk_writer(struct buffer *buffer)
 void terminate_disk_writer(void)
 {
     log_message("Waiting for writer");
-    writer_running = false;
-    ASSERT_0(pthread_cancel(writer_id));
-    ASSERT_0(pthread_cancel(transform_id));
+    stop_writer_thread();
     stop_reader(reader);
     ASSERT_0(pthread_join(transform_id, NULL));
     ASSERT_0(pthread_join(writer_id, NULL));

@@ -56,11 +56,11 @@ static bool parse_array(
 }
 
 
-bool parse_int_array(const char **string, struct int_array *result)
+bool parse_uint_array(const char **string, struct uint_array *result)
 {
     return parse_array(
-        string, (parser_t) parse_int,
-        (struct void_array *) result, sizeof(int));
+        string, (parser_t) parse_uint,
+        (struct void_array *) result, sizeof(unsigned int));
 }
 
 bool parse_double_array(const char **string, struct double_array *result)
@@ -133,7 +133,7 @@ static bool do_parse_line(
         parse_eos(&string);
 
     /* Report parse error. */
-    char *error = pop_error_handling(true);
+    char *error = pop_error_handling(!ok);
     if (!ok)
         print_error("Error parsing %s, line %d, offset %zd: %s",
             file_name, line_number, string - line_buffer, error);
@@ -157,8 +157,12 @@ static bool read_one_line(
     errno = 0;
     *eof = fgets(line_buffer, line_length, input) == NULL;
     if (*eof)
+    {
+        *length_read = 0;
+        line_buffer[0] = '\0';
         return TEST_OK_(errno == 0,
             "Error reading file on line %d", line_number);
+    }
     else
     {
         *length_read = strlen(line_buffer);
@@ -227,10 +231,9 @@ bool config_parse_file(
         ok =
             read_line(
                 input, line_buffer, sizeof(line_buffer), &line_number, &eof)  &&
-            IF_(!eof,
-                do_parse_line(
-                    file_name, line_number, line_buffer,
-                    config_table, config_size, seen));
+            do_parse_line(
+                file_name, line_number, line_buffer,
+                config_table, config_size, seen);
     }
     fclose(input);
 

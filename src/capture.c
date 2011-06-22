@@ -19,14 +19,14 @@
 #include <math.h>
 
 #include "error.h"
-#include "sniffer.h"
+#include "fa_sniffer.h"
 #include "mask.h"
 #include "matlab.h"
 #include "parse.h"
 #include "reader.h"
 
 
-#define DEFAULT_SERVER      "fa-archiver.cs.diamond.ac.uk"
+#define DEFAULT_SERVER      "fa-archiver.diamond.ac.uk"
 #define BUFFER_SIZE         (1 << 16)
 #define PROGRESS_INTERVAL   (1 << 18)
 
@@ -194,10 +194,10 @@ static void usage(char *argv0)
 "   -o:  Save output to specified file, otherwise stream to stdout\n"
 "   -f:  Specify data format, can be -fF for FA (the default), -fd[mask] for\n"
 "        single decimated data, or -fD[mask] for double decimated data, where\n"
-"        [mask] is an optional data mask, default value 7 (all fields).\n"
+"        [mask] is an optional data mask, default value 15 (all fields).\n"
 "        Decimated data is only available for archived data.\n"
 "           The bits in the data mask correspond to decimated fields:\n"
-"            1 => mean, 2 => min, 4 => max\n"
+"            1 => mean, 2 => min, 4 => max, 8 => standard deviation\n"
 "   -a   Capture all available data even if too much requested.  Otherwise\n"
 "        capture fails if more data requested than present in archive.\n"
 "   -R   Save in raw format, otherwise the data is saved in matlab format\n"
@@ -289,13 +289,13 @@ static bool parse_data_format(const char **string, enum data_format *format)
 
         if (**string == '\0')
         {
-            data_mask = 7;          // Read all fields by default
+            data_mask = 15;         // Read all fields by default
             return true;
         }
         else
             return
                 parse_uint(string, &data_mask)  &&
-                TEST_OK_(0 < data_mask  &&  data_mask <= 7,
+                TEST_OK_(0 < data_mask  &&  data_mask <= 15,
                     "Invalid data mask");
     }
 }
@@ -450,11 +450,10 @@ static bool initialise_signal(void)
 {
     struct sigaction interrupt = {
         .sa_handler = interrupt_capture, .sa_flags = 0 };
-    struct sigaction do_ignore = { .sa_handler = SIG_IGN, .sa_flags = 0 };
     return
         TEST_IO(sigfillset(&interrupt.sa_mask))  &&
         TEST_IO(sigaction(SIGINT,  &interrupt, NULL))  &&
-        TEST_IO(sigaction(SIGPIPE, &do_ignore, NULL));
+        TEST_IO(signal(SIGPIPE, SIG_IGN));
 }
 
 
@@ -509,9 +508,12 @@ static bool request_data(int sock)
 static bool check_response(int sock)
 {
     char response[1024];
-    if (TEST_read(sock, response, 1))
+    int rx;
+    if (TEST_IO(rx = read(sock, response, 1)))
     {
-        if (*response == '\0')
+        if (rx != 1)
+            return FAIL_("Unexpected server disconnect");
+        else if (*response == '\0')
             return true;
         else
         {
@@ -554,6 +556,38 @@ static void reset_progress(void)
 }
 
 
+/* Performs read until interrupted or end of file, treats both the same.  Any
+ * errors are ignored.  It's arguable whether this is the right action... */
+static size_t do_read(int file, void *buffer, size_t length)
+{
+    ssize_t rx = read(file, buffer, length);
+    if (rx == -1)
+    {
+        IGNORE(TEST_OK_(errno == EINTR, "Error reading from archiver"));
+        rx = 0;
+    }
+    return rx;
+}
+
+/* Performs write even if interrupted, retrying as necessary: we've not enabled
+ * signal retries as we want read() to be interruptible. */
+static bool do_write(int file, void *buffer, size_t length)
+{
+    while (length > 0)
+    {
+        ssize_t tx = write(file, buffer, length);
+        if (tx >= 0)    // A zero length write would be troubling here
+        {
+            length -= tx;
+            buffer += tx;
+        }
+        else if (!TEST_OK_(errno == EINTR, "Error writing to file"))
+            return false;
+        // If we get repeated EINTR returns that'll be a bit of a problem...
+    }
+    return true;
+}
+
 /* This routine reads data from sock and writes out complete frames until either
  * the sample count is reached or the read is interrupted. */
 static bool capture_data(int sock, unsigned int *frames_written)
@@ -567,13 +601,8 @@ static bool capture_data(int sock, unsigned int *frames_written)
     *frames_written = 0;
     while (running  &&  (sample_count == 0  ||  *frames_written < sample_count))
     {
-        int rx = read(sock, buffer + residue, BUFFER_SIZE - residue);
-        if (rx == -1)
-        {
-            TEST_OK_(errno == EINTR, "Error reading from server");
-            break;              // Truncated input needed be a failure
-        }
-        else if (rx == 0)
+        int rx = do_read(sock, buffer + residue, BUFFER_SIZE - residue);
+        if (rx == 0)
             break;              // Normal end of input
 
         rx = rx + residue;
@@ -583,7 +612,7 @@ static bool capture_data(int sock, unsigned int *frames_written)
         unsigned int to_write = frames_read * frame_size;
         if (frames_read > 0)
         {
-            ok = TEST_write(output_file, buffer, to_write);
+            ok = do_write(output_file, buffer, to_write);
             if (!ok)
                 break;
             *frames_written += frames_read;

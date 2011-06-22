@@ -1,16 +1,17 @@
 '''Simple FA capture library for reading data from the FA sniffer.'''
 
-DEFAULT_SERVER = 'fa-archiver.cs.diamond.ac.uk'
+DEFAULT_SERVER = 'fa-archiver.diamond.ac.uk'
 DEFAULT_PORT = 8888
-
-if __name__ == '__main__':
-    from pkg_resources import require
-    require('cothread')
 
 import socket
 import struct
 import numpy
 import cothread
+
+
+__all__ = [
+    'connection', 'subscription', 'get_sample_frequency', 'get_decimation',
+    'Server']
 
 
 MASK_SIZE = 256         # Number of possible bits in a mask
@@ -39,7 +40,7 @@ class connection:
     class Error(Exception):
         pass
 
-    def __init__(self, server=DEFAULT_SERVER, port=DEFAULT_PORT):
+    def __init__(self, server = DEFAULT_SERVER, port = DEFAULT_PORT):
         self.sock = socket.create_connection((server, port))
         self.sock.setblocking(0)
         self.buf = []
@@ -47,7 +48,7 @@ class connection:
     def close(self):
         self.sock.close()
 
-    def recv(self, block_size=65536, timeout=0.2):
+    def recv(self, block_size = 65536, timeout = 1):
         if not cothread.poll_list(
                 [(self.sock.fileno(), cothread.POLLIN)], timeout):
             raise socket.timeout('Receive timeout')
@@ -91,6 +92,10 @@ class subscription(connection):
         self.mask = normalise_mask(mask)
         self.count = count_mask(self.mask)
         self.decimated = decimated
+        if decimated:
+            self.decimation = get_decimation(**kargs)
+        else:
+            self.decimation = 1
 
         flags = 'Z'
         if decimated: flags = flags + 'D'
@@ -106,7 +111,7 @@ class subscription(connection):
             wf = s.read(N)
         wf[n, b, x] = sample n of BPM b on channel x, where x=0 for horizontal
         position and x=1 for vertical position.'''
-        self.t0 = (self.t0 + samples) & 0xffffffff
+        self.t0 = (self.t0 + self.decimation * samples) & 0xffffffff
         raw = self.read_block(8 * samples * self.count)
         array = numpy.frombuffer(raw, dtype = numpy.int32)
         return array.reshape((samples, self.count, 2))
@@ -132,9 +137,19 @@ def get_decimation(**kargs):
     return int(server_command('CC\n', **kargs))
 
 
-if __name__ == '__main__':
-    f = sample_frequency()
-    import sys
-    s = subscription(map(int, sys.argv[1:]))
-    while True:
-        print numpy.mean(s.read(10000), 0)
+class Server:
+    '''A simple helper class to gather together the information required to
+    identify the requested server and act as a proxy for the useful commands in
+    this module.'''
+
+    def __init__(self, server, port):
+        self.server = server
+        self.port = port
+
+        self.sample_frequency = \
+            get_sample_frequency(server = server, port = port)
+        self.decimation = get_decimation(server = server, port = port)
+
+    def subscription(self, mask, decimated=False):
+        return subscription(
+            mask, decimated, server = self.server, port = self.port)
