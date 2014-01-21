@@ -1,0 +1,4 @@
+PREFIX    =/usr/local
+SCRIPT_DIR=/usr/local/bin
+PYTHON    =/usr/bin
+

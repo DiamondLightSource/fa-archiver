@@ -30,7 +30,7 @@
 %      michael.abbott@diamond.ac.uk
 function [names, ids] = fa_getids(all_names)
     if isunix
-        fa_ids_file = '/home/ops/diagnostics/concentrator/fa-ids.sr';
+        fa_ids_file = '/segfs/tango/cppserver/machine/diagnostic/bpm/FastDataArchiver/fa-ids.sr';
     else
         fa_ids_file = fullfile(fileparts(mfilename('fullpath')), 'fa-ids.sr');
     end

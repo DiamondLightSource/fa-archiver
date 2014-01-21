@@ -62,7 +62,7 @@ function d = fa_load(tse, mask, type, server)
         type = 'F';
     end
     if nargin < 4
-        server = 'fa-archiver.diamond.ac.uk';
+        server = 'fdaserv.esrf.fr';
     end
 
     % Parse arguments

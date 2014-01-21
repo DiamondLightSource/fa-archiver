@@ -26,10 +26,6 @@
 #      OX11 0DE
 #      michael.abbott@diamond.ac.uk
 
-if __name__ == '__main__':
-    from pkg_resources import require
-    require('cothread')
-    require('numpy')
 
 import os, sys
 import optparse

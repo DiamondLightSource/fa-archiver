@@ -1,0 +1,134 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides: fdad
+# Required-Start: local
+# Required-Stop: sshd
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: start/stop fa-archiver on boot/shutdown
+# Description: This is a script for starting/stopping the Fast
+#              Data Archiver.
+#              See http://controls.diamond.ac.uk/downloads/other/fa-archiver/
+### END INIT INFO
+
+# the following is chkconfig init header
+# fdad:        This starts and stops fa-archiver
+#
+# chkconfig:   2345 99 30
+# description: This starts the Fast Data Archiver program, \
+#              which collects all 224 Liberas position at 10kHz \
+#              and logs it on 25 TB available on /dev/data_vg/data \
+#              physical disks. These disk are the 11 + 1 Hot Spare \
+#              3TB sata disks connected on the front panel of the server.
+
+# processname: /usr/local/bin/fa-archiver
+# config: /lib/modules/2.6.32-431.el6.x86_64/kernel/drivers/misc/fa_sniffer.ko
+# config: /etc/fda/decimate.config
+# config: /dev/data_vg/data
+#
+# Return values according to LSB for all commands but status:
+# 0 - success
+# 1 - generic or unspecified error
+# 2 - invalid or excess argument(s)
+# 3 - unimplemented feature (e.g. "reload")
+# 4 - insufficient privilege
+# 5 - program is not installed
+# 6 - program is not configured
+# 7 - program is not running
+
+PATH=/sbin:/bin:/usr/bin:/usr/sbin:/usr/local/bin
+prog="fa-archiver"
+
+# Source function library.
+. /etc/init.d/functions
+
+# Allow anyone to run status
+if [ "$1" = "status" ] ; then
+        status $prog
+        RETVAL=$?
+        exit $RETVAL
+fi
+
+# Check that we are root ... so non-root users stop here
+#test $EUID = 0  ||  exit 4
+if test $EUID = 0 ; then
+        echo "root privilege: ok."
+else
+        echo
+        echo "You must be root. Leaving..."
+        echo
+        exit 4
+fi
+
+RETVAL=0
+
+start(){
+        test -x /lib/modules/`uname -r`/kernel/drivers/misc/fa_sniffer.ko || exit 5
+        test -x /usr/local/bin/fa-archiver  || exit 5
+        test -f /etc/fda/decimate.config || exit 6
+        test -b /dev/data_vg/data || exit 6
+
+        echo -n $"Loading driver..."
+        lsmod | grep fa_sniffer
+        RETVAL=$?
+        if test $RETVAL = 0 ; then
+                echo
+                echo "Driver is already loaded."
+        else
+                insmod /lib/modules/`uname -r`/kernel/drivers/misc/fa_sniffer.ko
+                RETVAL=$?
+        fi
+        if test $RETVAL = 0 ; then
+                echo
+                echo "Starting fa-archiver: "
+                /usr/local/bin/fa-archiver -D -p /var/run/fda.pid -c /etc/fda/decimate.config /dev/data_vg/data
+                RETVAL=$?
+        else
+                echo "Loading driver failed. Check /lib/modules/`uname -r`/kernel/drivers/misc/fa_sniffer.ko"
+        fi
+}
+
+stop(){
+        echo -n $"Stopping $prog: "
+        killproc $prog
+        echo
+        RETVAL=$?
+        if test $RETVAL = 0 ; then
+                rmmod fa_sniffer
+                RETVAL=$?
+                if test $RETVAL = 0 ; then
+                        echo "Driver unloaded..."
+                else
+                        echo "Unable to remove driver."
+                fi
+        else
+                echo "Unable to kill $prog."
+        fi
+        return $RETVAL
+}
+
+restart(){
+        stop
+        start
+}
+
+
+
+# See how we were called.
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        restart
+        ;;
+    *)
+        echo $"Usage: $0 {start|stop|restart|status}"
+        RETVAL=3
+esac
+
+exit $RETVAL
+

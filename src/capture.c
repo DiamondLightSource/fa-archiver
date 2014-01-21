@@ -54,7 +54,7 @@
 #include "reader.h"
 
 
-#define DEFAULT_SERVER      "fa-archiver.diamond.ac.uk"
+#define DEFAULT_SERVER      "fdaserv.esrf.fr"
 #define BUFFER_SIZE         (1 << 16)
 #define PROGRESS_INTERVAL   (1 << 18)
 

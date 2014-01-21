@@ -26,7 +26,7 @@
 #      OX11 0DE
 #      michael.abbott@diamond.ac.uk
 
-DEFAULT_SERVER = 'fa-archiver.diamond.ac.uk'
+DEFAULT_SERVER = 'fdaserv.esrf.fr'
 DEFAULT_PORT = 8888
 
 import socket

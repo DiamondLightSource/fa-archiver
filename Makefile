@@ -44,7 +44,6 @@ BIN_TARGETS = $(filter-out $(NON_BIN_TARGETS) $(BIN_BUILD_DIR),$(MAKECMDGOALS))
 
 
 default $(BIN_TARGETS): $(BIN_BUILD_DIR)
-	make -C $(TOP)/python
 	$(BIN_BUILD) $@
 
 docs: $(DOCS_BUILD_DIR)
@@ -58,15 +57,12 @@ $(BUILD_DIR)/%:
 
 clean:
 	rm -rf $(BUILD_DIR) prefix
-	make -C $(TOP)/python clean
 
-install: $(BIN_BUILD_DIR) $(DOCS_BUILD_DIR) $(MATLAB_BUILD_DIR)
+install: $(BIN_BUILD_DIR)
 ifndef PREFIX
 	@echo >&2 Must define PREFIX; false
 endif
 	$(BIN_BUILD) install
-	$(DOCS_BUILD) install
-	make -C $(TOP)/python install
-#	$(MATLAB_BUILD) install
+#	$(DOCS_BUILD) install
 
 .PHONY: $(NON_BIN_TARGETS)

@@ -33,7 +33,7 @@ function fa_zoomer(server)
     h = {};
 
     if nargin == 0
-        h.server = 'fa-archiver.diamond.ac.uk';
+        h.server = 'fdaserv.esrf.fr';
     elseif strcmp(server, 'booster')
         h.server = 'fa-archiver.diamond.ac.uk:8889';
     else
@@ -75,7 +75,7 @@ function fa_zoomer(server)
 
     % Some extra controls on the line above
     h_pos = 10; v_pos = v_pos + 30;
-    control('popup', fa_getids(), 150, 'Valid BPM names', ...
+    control('popup', fa_getids(), 170, 'Valid BPM names', ...
         'Value', 4, 'Callback', protect(@set_bpm_list));
 
     clear global h_pos v_pos;
@@ -245,12 +245,12 @@ function plotfa(h, d)
     if get(h.ylim, 'Value')
         if length(size(d.data)) == 4
             switch data_type
-                case 1;     set_ylim = [-100 100];
-                case 2;     set_ylim = [0 10];
-                case 3;     set_ylim = [-10 10];
+                case 1;     set_ylim = [-300 300];
+                case 2;     set_ylim = [0 30];
+                case 3;     set_ylim = [-300 300];
             end
         else
-            set_ylim = [-100 100];
+            set_ylim = [-300 300];
         end
     else
         set_ylim = [];
