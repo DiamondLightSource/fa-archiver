@@ -2,7 +2,7 @@
 
 # These definitions are designed to be overridden by the installer.
 PYTHON=python
-HERE="$(dirname "$0")"
+HERE="$(dirname "$(readlink -f "$0")")"
 
 # Ensure that falib is on the python path
 export PYTHONPATH="$HERE${PYTHONPATH:+:}$PYTHONPATH"
