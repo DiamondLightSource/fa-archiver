@@ -69,10 +69,6 @@ static unsigned int fa_entry_count;         // Read from header at startup
 /* Reading from disk: general support. */
 
 
-struct iter_mask {
-    unsigned int count;
-    uint16_t index[MAX_FA_ENTRY_COUNT];
-};
 
 
 struct reader {
@@ -103,32 +99,6 @@ struct reader {
     unsigned int decimation_log2;       // FA samples per read sample
     unsigned int samples_per_fa_block;  // Samples in a single FA block
 };
-
-
-/* Converts an external mask into indexes into the archive. */
-static bool mask_to_archive(
-    const struct filter_mask *mask, struct iter_mask *iter)
-{
-    const struct disk_header *header = get_header();
-    unsigned int ix = 0;
-    unsigned int n = 0;
-    bool ok = true;
-    for (unsigned int i = 0; ok  &&  i < fa_entry_count; i ++)
-    {
-        if (test_mask_bit(mask, i))
-        {
-            ok = TEST_OK_(test_mask_bit(&header->archive_mask, i),
-                "BPM %d not in archive", i);
-            iter->index[n] = (uint16_t) ix;
-            n += 1;
-        }
-        if (test_mask_bit(&header->archive_mask, i))
-            ix += 1;
-    }
-    iter->count = n;
-    return ok;
-}
-
 
 static unsigned int round_up(uint64_t a, uint64_t b)
 {
@@ -387,7 +357,7 @@ static void release_timestamp_buffer(struct ts_buffer *ts_buffer)
 
 /* Result of parsing a read command. */
 struct read_parse {
-    struct filter_mask read_mask;   // List of BPMs to be read
+    struct iter_mask read_mask;     // List of BPMs to be read
     uint64_t samples;               // Requested number of samples
     uint64_t start;                 // Data start (in microseconds into epoch)
     uint64_t end;                   // Data end (alternative to count)
@@ -401,16 +371,44 @@ struct read_parse {
     bool check_id0;                 // Consider id0 gap as a gap
 };
 
+/* Converts an external mask into indexes into the archive. */
+static bool mask_to_archive(const struct iter_mask *mask, struct iter_mask *archivemask)
+{
+    const struct disk_header *header = get_header();
+    bool ok = true;
+    int16_t aid[MAX_FA_ENTRY_COUNT];
+    int16_t c = 0;
+
+    memset(aid,-1,sizeof(aid));
+    archivemask->count = 0;
+
+    // Compute archive index
+    for (unsigned int i = 0; i < MAX_FA_ENTRY_COUNT; i ++) {
+      if( test_mask_bit(&header->archive_mask, i) ) {
+         aid[i] = c++;
+      }
+    }
+
+    // Build the archive mask
+    for (unsigned int i = 0; ok  &&  i < mask->count; i ++) {
+
+      uint16_t id = mask->index[i];
+      ok = TEST_OK_( (aid[id]>=0),"BPM %d not in archive", id);
+      archivemask->index[archivemask->count++] = (uint16_t)aid[id];
+
+    }
+
+    return ok;
+}
 
 static bool transfer_data(
     const struct read_parse *parse, struct read_buffers *read_buffers,
-    int archive, struct write_buffer *out_buffer, struct iter_mask *iter,
-    struct ts_buffer *ts_buffer,
+    int archive, struct write_buffer *out_buffer, struct ts_buffer *ts_buffer,
     unsigned int ix_block, unsigned int offset, uint64_t count)
 {
     const struct reader *reader = parse->reader;
     const struct disk_header *header = get_header();
-    size_t line_size_out = iter->count * reader->output_size(parse->data_mask);
+    size_t line_size_out = parse->read_mask.count * reader->output_size(parse->data_mask);
 
     bool ok = true;
     while (ok  &&  count > 0)
@@ -420,9 +418,11 @@ static bool transfer_data(
 
         /* Read a single timeframe for each id from the archive.  This is
          * normally a single large disk IO block per BPM id. */
-        for (unsigned int i = 0; ok  &&  i < iter->count; i ++)
-            ok = reader->read_block(
-                archive, ix_block, iter->index[i], read_buffers->buffers[i]);
+        for (unsigned int i = 0; ok  &&  i < parse->read_mask.count; i ++) {
+
+          ok = reader->read_block(
+                  archive, ix_block, parse->read_mask.index[i], read_buffers->buffers[i]);
+        }
 
         /* Transpose the read data into output lines and write out in buffer
          * sized chunks. */
@@ -448,7 +448,7 @@ static bool transfer_data(
                 line_count = samples_read - offset;
 
             reader->write_lines(
-                line_count, iter->count,
+                line_count, parse->read_mask.count,
                 read_buffers, offset, parse->data_mask, line_buffer);
             release_buffer(out_buffer, line_count * line_size_out);
 
@@ -472,7 +472,6 @@ static bool read_data(
     int scon, const char *client_name, const struct read_parse *parse)
 {
     unsigned int ix_block, offset;      // Index of first point to send
-    struct iter_mask iter = { 0 };      // List of IDs to read
     int archive = -1;                   // Archive file for reading FA or D data
     uint64_t samples = parse->samples;  // Number of samples to return
 
@@ -491,11 +490,9 @@ static bool read_data(
         IF_(parse->only_contiguous,
             check_run(parse->reader,
                 parse->check_id0, ix_block, offset, samples))  &&
-        /* Prepare the iteration mask for efficient data delivery. */
-        mask_to_archive(&parse->read_mask, &iter)  &&
         /* Capture all the buffers needed.  This can fail if there are too many
          * readers trying to run at once. */
-        lock_buffers(&read_buffers, iter.count)  &&
+        lock_buffers(&read_buffers, parse->read_mask.count)  &&
         allocate_write_buffer(&out_buffer, 1)  &&
         allocate_timestamp_buffer(
             parse->send_timestamp, parse->send_id0, &ts_buffer,
@@ -514,7 +511,7 @@ static bool read_data(
                 parse->reader, ix_block, offset)  &&
             transfer_data(
                 parse, &read_buffers, archive, &out_buffer,
-                &iter, &ts_buffer, ix_block, offset, samples)  &&
+                &ts_buffer, ix_block, offset, samples)  &&
             flush_buffer(&out_buffer);
     }
 
@@ -522,7 +519,7 @@ static bool read_data(
     release_write_buffer(&out_buffer);
     unlock_buffers(&read_buffers);
     if (archive != -1)
-        close(archive);
+        TEST_IO(close(archive));
 
     return write_ok;
 }
@@ -777,11 +774,14 @@ static bool parse_options(const char **string, struct read_parse *parse)
 /* read-request = "R" source "M" filter-mask start end options . */
 static bool parse_read_request(const char **string, struct read_parse *parse)
 {
+  struct iter_mask external_mask;
+
     return
         parse_char(string, 'R')  &&
         parse_source(string, parse)  &&
         parse_char(string, 'M')  &&
-        parse_mask(string, fa_entry_count, &parse->read_mask)  &&
+        parse_ordered_mask(string, fa_entry_count, &external_mask)  &&
+        mask_to_archive(&external_mask,&parse->read_mask) &&
         parse_time_or_seconds(string, &parse->start)  &&
         parse_end(string, &parse->end, &parse->samples)  &&
         parse_options(string, parse);

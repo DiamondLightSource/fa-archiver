@@ -177,6 +177,7 @@ static bool process_opts(int *argc, char ***argv)
             case 'T':
                 ok = DO_PARSE("timestamp IIR",
                     parse_double, optarg, &timestamp_iir);
+                break;
             case 'n':   dry_run = true;                             break;
             case 'q':   quiet_allocate = true;                      break;
             case '?':
@@ -325,6 +326,7 @@ static bool fill_zeros(int file_fd, size_t written)
     if (ok  &&  size_left > 0)
         ok = TEST_write(file_fd, zeros, (size_t) size_left);
     printf("\n");
+    free(zeros);
     return ok;
 }
 
@@ -380,53 +382,63 @@ static bool do_dump_index(int file_fd, struct disk_header *header)
             printf("\n");
             last_block = block;
         }
+        TEST_IO(munmap(data_index, header->index_data_size));
     }
     return ok;
 }
 
 
-int main(int argc, char **argv)
+/* Read an existing header and report. */
+static bool prepare_read_only(void)
 {
-    if (!process_args(argc, argv))
-        /* For argument errors return 1. */
-        return 1;
-
-    bool ok;
     int file_fd;
-    if (read_only)
-    {
-        struct disk_header header;
-        ok =
-            TEST_IO_(file_fd = open(file_name, O_RDONLY),
-                "Unable to read file \"%s\"", file_name)  &&
+    struct disk_header header;
+    return
+        TEST_IO_(file_fd = open(file_name, O_RDONLY),
+            "Unable to read file \"%s\"", file_name)  &&
+        FINALLY(
             TEST_read(file_fd, &header, sizeof(header))  &&
             IF_(do_validate,
                 get_filesize(file_fd, &file_size)  &&
                 validate_header(&header, file_size))  &&
             IF_(dump_header, DO_(print_header(stdout, &header)))  &&
-            IF_(dump_index, do_dump_index(file_fd, &header));
-    }
-    else if (dry_run)
-    {
-        struct disk_header header = {};
-        ok =
-            IF_(!file_size_given,
-                TEST_IO_(file_fd = open(file_name, O_RDONLY),
-                    "Unable to open archive \"%s\"", file_name)  &&
-                FINALLY(
-                    get_filesize(file_fd, &file_size),
-                    TEST_IO(close(file_fd))))  &&
-            prepare_new_header(&header);
-    }
-    else
-    {
-        int open_flags =
-            (file_size_given ? O_CREAT | O_TRUNC : 0) |
-            (quiet_allocate ? 0 : O_DIRECT) | O_WRONLY;
-        size_t written;
-        ok =
-            TEST_IO_(file_fd = open(file_name, open_flags, 0664),
-                "Unable to write to file \"%s\"", file_name)  &&
+            IF_(dump_index, do_dump_index(file_fd, &header)),
+
+            // Close opened file
+            TEST_IO(close(file_fd)));
+}
+
+
+/* Prepare dummy header and report what would be written. */
+static bool prepare_dry_run(void)
+{
+    int file_fd;
+    struct disk_header header = {};
+    return
+        IF_(!file_size_given,
+            TEST_IO_(file_fd = open(file_name, O_RDONLY),
+                "Unable to open archive \"%s\"", file_name)  &&
+            FINALLY(
+                get_filesize(file_fd, &file_size),
+
+                TEST_IO(close(file_fd))))  &&
+        prepare_new_header(&header);
+}
+
+
+/* Actually do the work of creating a header and initialising the data store (if
+ * required). */
+static bool prepare_create(void)
+{
+    int file_fd;
+    int open_flags =
+        (file_size_given ? O_CREAT | O_TRUNC : 0) |
+        (quiet_allocate ? 0 : O_DIRECT) | O_WRONLY;
+    size_t written;
+    return
+        TEST_IO_(file_fd = open(file_name, open_flags, 0664),
+            "Unable to write to file \"%s\"", file_name)  &&
+        FINALLY(
             lock_archive(file_fd)  &&
             IF_(!file_size_given,
                 get_filesize(file_fd, &file_size))  &&
@@ -439,9 +451,24 @@ int main(int argc, char **argv)
                         file_fd, (off64_t) written,
                         (off64_t) (file_size - written))),
                     /* If we use full_zeros we can show progress to the user. */
-                    fill_zeros(file_fd, written)))  &&
-            TEST_IO(close(file_fd));
-    }
+                    fill_zeros(file_fd, written))),
+
+        TEST_IO(close(file_fd)));
+}
+
+int main(int argc, char **argv)
+{
+    if (!process_args(argc, argv))
+        /* For argument errors return 1. */
+        return 1;
+
+    bool ok;
+    if (read_only)
+        ok = prepare_read_only();
+    else if (dry_run)
+        ok = prepare_dry_run();
+    else
+        ok = prepare_create();
 
     return ok ? 0 : 2;
 }

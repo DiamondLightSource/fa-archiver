@@ -90,6 +90,8 @@ static unsigned int buffer_blocks = BUFFER_BLOCKS;
 static int server_socket = 8888;
 /* Decimation configuration file. */
 static const char *decimation_config = NULL;
+/* File from which to load list of FA ids. */
+static const char *fa_id_list = NULL;
 /* Selects data source. */
 static enum sniffer_source {
     SNIFFER_UNSET,          // Default unset value
@@ -105,7 +107,9 @@ static bool verbose = true;
 /* Enable SO_REUSEADDR option on listening socket. */
 static bool reuseaddr = false;
 /* Specify address to bind server socket to. */
-static char *server_bind_address = NULL;
+static const char *server_bind_address = NULL;
+/* Specify server name announced to clients. */
+static const char *server_name = "";
 /* If non zero, identifies FA id used for event stream. */
 static unsigned int events_fa_id = (unsigned int) -1;
 
@@ -119,6 +123,8 @@ static void usage(void)
 "Options:\n"
 "    -c:  Specify decimation configuration file.  If this is specified then\n"
 "         streaming decimated data will be available for subscription.\n"
+"    -l:  Specify list of FA ids for reporting to clients\n"
+"    -n:  Specify server name to announce to clients\n"
 "    -d:  Specify device to use for FA sniffer (default /dev/fa_sniffer0)\n"
 "    -r   Run sniffer thread at boosted priority.  Needs real time support\n"
 "    -b:  Specify number of buffered input blocks (default %u)\n"
@@ -153,10 +159,12 @@ static bool process_options(int *argc, char ***argv)
     bool ok = true;
     while (ok)
     {
-        switch (getopt(*argc, *argv, "+hc:d:rb:qtDp:s:F:E:B:XRGN"))
+        switch (getopt(*argc, *argv, "+hc:l:n:d:rb:qtDp:s:F:E:B:XRGN"))
         {
             case 'h':   usage();                                    exit(0);
             case 'c':   decimation_config = optarg;                 break;
+            case 'n':   server_name = optarg;                       break;
+            case 'l':   fa_id_list = optarg;                        break;
             case 'r':   boost_priority = true;                      break;
             case 'q':   verbose = false;                            break;
             case 't':   timestamp_logging(true);                    break;
@@ -234,18 +242,26 @@ void shutdown_archiver(void)
 
 static void at_exit(int signum)
 {
-    log_message("Caught signal %d", signum);
     shutdown_archiver();
 }
 
 static bool initialise_signals(void)
 {
+    sigset_t signal_mask;
     struct sigaction do_shutdown = {
         .sa_handler = at_exit, .sa_flags = SA_RESTART };
     struct sigaction do_ignore = {
         .sa_handler = SIG_IGN, .sa_flags = SA_RESTART };
     return
         TEST_IO(sem_init(&shutdown_semaphore, 0, 0))  &&
+
+        /* Make sure that we can actually see the signals we're going handle,
+         * and block everything else. */
+        TEST_IO(sigfillset(&signal_mask))  &&
+        TEST_IO(sigdelset(&signal_mask, SIGHUP))  &&
+        TEST_IO(sigdelset(&signal_mask, SIGINT))  &&
+        TEST_IO(sigdelset(&signal_mask, SIGTERM))  &&
+        TEST_IO(sigprocmask(SIG_SETMASK, &signal_mask, NULL))  &&
 
         TEST_IO(sigfillset(&do_shutdown.sa_mask))  &&
         /* Catch the usual interruption signals and use them to trigger an
@@ -290,7 +306,7 @@ static bool maybe_daemonise(void)
 {
     int pid_file = -1;
     char pid[32];
-    return
+    bool ok =
         /* The logic here is a little odd: we want to check that we can write
          * the PID file before daemonising, to ensure that the caller gets the
          * error message if daemonising fails, but we need to write the PID file
@@ -305,8 +321,10 @@ static bool maybe_daemonise(void)
             DO_(start_logging("FA archiver")))  &&
         IF_(pid_filename,
             DO_(sprintf(pid, "%d", getpid()))  &&
-            TEST_IO(write(pid_file, pid, strlen(pid)))  &&
-            TEST_IO(close(pid_file)));
+            TEST_IO(write(pid_file, pid, strlen(pid))));
+    if (pid_file != -1)
+        TEST_IO(close(pid_file));
+    return ok;
 }
 
 
@@ -357,6 +375,7 @@ int main(int argc, char **argv)
         initialise_disk_writer(
             output_filename, &input_block_size, &fa_entry_count,
             events_fa_id)  &&
+        load_fa_ids(fa_id_list, fa_entry_count)  &&
         create_buffer(&fa_block_buffer, input_block_size, buffer_blocks)  &&
         TEST_OK_(
             events_fa_id == (unsigned int) -1 || events_fa_id < fa_entry_count,
@@ -367,7 +386,7 @@ int main(int argc, char **argv)
                 fa_entry_count, events_fa_id))  &&
         initialise_sniffer(fa_block_buffer, fa_entry_count)  &&
         initialise_server(
-            fa_block_buffer, decimated_buffer, events_fa_id,
+            fa_block_buffer, decimated_buffer, events_fa_id, server_name,
             server_bind_address, server_socket, extra_commands, reuseaddr)  &&
         initialise_reader(output_filename)  &&
 

@@ -183,6 +183,7 @@ void log_message(const char *message, ...)
         va_list args;
         va_start(args, message);
         vlog_message(LOG_INFO, message, args);
+        va_end(args);
     }
 }
 
@@ -191,6 +192,7 @@ void log_error(const char *message, ...)
     va_list args;
     va_start(args, message);
     vlog_message(LOG_ERR, message, args);
+    va_end(args);
 }
 
 
@@ -229,6 +231,8 @@ void print_error(const char *format, ...)
     va_start(args, format);
     char *message;
     IGNORE(vasprintf(&message, format, args));
+    va_end(args);
+
     message = add_strerror(message, last_errno);
     if (!save_message(message))
     {
@@ -249,6 +253,33 @@ void panic_error(const char *filename, int line)
 
     fflush(stderr);
     _exit(255);
+}
+
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/* Helper functions for reading and writing. */
+
+#define ENSURE_ACTION(action, fd, buf, count) \
+    size_t total = 0; \
+    while (count > total) \
+    { \
+        ssize_t processed = action(fd, buf + total, count - total); \
+        if (processed < 0) \
+            return processed; \
+        else if (processed == 0) \
+            break; \
+        total += (size_t) processed; \
+    } \
+    return (ssize_t) total
+
+ssize_t ensure_write(int fd, const void *buf, size_t count)
+{
+    ENSURE_ACTION(write, fd, buf, count);
+}
+
+ssize_t ensure_read(int fd, void *buf, size_t count)
+{
+    ENSURE_ACTION(read, fd, buf, count);
 }
 
 

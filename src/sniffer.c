@@ -65,7 +65,7 @@ static struct fa_entry esrf_last_row[ESRF_CORRECTOR_COUNT];
 /* Sign extend from 14 to 32 bits. */
 static int32_t sign_extend(int32_t x)
 {
-    return (int32_t) ((uint32_t) x << (32-14)) >> 14;
+    return (int32_t) ((uint32_t) x << (32-14)) >> (32-14);
 }
 
 static void extract_esrf_correctors(void *block, size_t block_size)
@@ -73,7 +73,7 @@ static void extract_esrf_correctors(void *block, size_t block_size)
     const struct disk_header *header = get_header();
     ASSERT_OK(header->fa_entry_count >= 512);
     unsigned int row_count =
-        block_size / FA_ENTRY_SIZE / header->fa_entry_count;
+        (unsigned int)(block_size / FA_ENTRY_SIZE / header->fa_entry_count);
 
     struct fa_entry *row = block;
     struct fa_entry *last_row = esrf_last_row;

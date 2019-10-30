@@ -91,14 +91,18 @@ static bool parse_raw_mask(
     for (unsigned int i = count; i > 0; )
     {
         i -= 1;
-        unsigned int ch = *(*string)++;
+        unsigned int ch = **string;
         unsigned int nibble;
         if ('0' <= ch  &&  ch <= '9')
             nibble = ch - '0';
         else if ('A' <= ch  &&  ch <= 'F')
             nibble = ch - 'A' + 10;
+        else if (ch == '\0')
+            return FAIL_("Mask too short");
         else
             return FAIL_("Unexpected character in mask");
+
+        *string += 1;
         // 2 nibbles per byte
         mask->mask[i / 2] |= (uint8_t) (nibble << (4 * (i % 2)));
     }
@@ -138,6 +142,55 @@ bool parse_mask(
     }
 }
 
+bool parse_ordered_mask(
+        const char **string, unsigned int fa_entry_count, struct iter_mask *mask) {
+
+    bool ok;
+
+    mask->count = 0;
+
+    if (read_char(string, 'R')) {
+
+        struct filter_mask rmask;
+        memset(rmask.mask, 0, sizeof(rmask.mask));
+        ok = parse_raw_mask(string, fa_entry_count, &rmask);
+        if(!ok)
+            return false;
+
+        for (unsigned int bit = 0; bit < fa_entry_count; bit++) {
+            if(test_mask_bit(&rmask,bit)) {
+                mask->index[mask->count] = (uint16_t)bit;
+                mask->count++;
+            }
+        }
+
+        return true;
+
+    } else {
+
+        ok = true;
+        do {
+            unsigned int id;
+            ok = parse_id(string, fa_entry_count, &id);
+            if (ok)
+            {
+                unsigned int end_id = id;
+                if (read_char(string, '-'))
+                    ok = parse_id(string, fa_entry_count, &end_id)  &&
+                                  TEST_OK_(id <= end_id,
+                                  "Range %d-%d is empty", id, end_id);
+                for (unsigned int i = id; ok  &&  i <= end_id; i ++) {
+                    mask->index[mask->count] = (uint16_t)i;
+                    mask->count++;
+                }
+            }
+        } while (ok  &&  read_char(string, ','));
+
+        return ok;
+
+    }
+
+}
 
 /* Support functions for format_mask() to help safely write values into a
  * string. */
@@ -217,4 +270,129 @@ unsigned int format_mask(
         buffer[0] = 'R';
         return format_raw_mask(mask, fa_entry_count, buffer + 1);
     }
+}
+
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/* Support for list of FA ids. */
+
+struct fa_id_list {
+    const char *description;
+    const char *x_name;
+    const char *y_name;
+};
+
+static struct fa_id_list *fa_id_list;
+static uint32_t id_list_length;
+
+
+/* Parses a white-space delimited word if present, returns false if nothing
+ * found and assigns NULL to result. */
+static bool maybe_parse_word(const char **string, const char **result)
+{
+    const char *start = *string;
+    const char *end = strchrnul(start, ' ');
+    if (end == start)
+    {
+        *result = NULL;
+        return false;
+    }
+    else
+    {
+        size_t length = (size_t) (end - start);
+        char *word = malloc(length + 1);
+        memcpy(word, start, length);
+        word[length] = '\0';
+        *string = end;
+        *result = word;
+        return true;
+    }
+}
+
+/* Each line in the file consists of up to four whitespace separated fields:
+ *  id [description] [x_name] [y_name]
+ */
+static bool parse_fa_id_line(const char **line, bool seen[])
+{
+    int id;
+    bool ok =
+        parse_int(line, &id)  &&
+        TEST_OK_(0 <= id  &&  (uint32_t) id < id_list_length,
+            "FA id %d out of range", id)  &&
+        TEST_OK_(!seen[id], "FA id %u repeated", id);
+    if (ok)
+    {
+        seen[id] = true;
+        struct fa_id_list *entry = &fa_id_list[id];
+        IGNORE(
+            skip_whitespace(line)  &&
+            maybe_parse_word(line, &entry->description)  &&
+            skip_whitespace(line)  &&
+            maybe_parse_word(line, &entry->x_name)  &&
+            skip_whitespace(line)  &&
+            maybe_parse_word(line, &entry->y_name));
+    }
+    return ok;
+}
+
+static bool load_fa_ids_file(const char *filename)
+{
+    FILE *input;
+    bool ok = TEST_NULL_(input = fopen(filename, "r"),
+        "Unable to open IDs file \"%s\"", filename);
+    if (ok)
+    {
+        bool seen[id_list_length];
+        memset(seen, 0, id_list_length * sizeof(bool));
+
+        char line[1024];
+        while (ok  &&  fgets(line, sizeof(line), input))
+        {
+            /* Check the line hasn't been truncated.  This also complains if the
+             * file ends without a newline, but that's too bad. */
+            char *eol;
+            ok =
+                TEST_NULL_(eol = strchr(line, '\n'),
+                    "Line truncated or missing newline at end of file")  &&
+                DO_(*eol = '\0')  &&
+                /* Fixed format: blank lines or lines beginning with # are
+                 * ignored, all other lines must be a number followed by
+                 * optional whitespace followed by an optional description. */
+                IF_(line[0] != '\0'  &&  line[0] != '#',
+                    DO_PARSE("FA ID file", parse_fa_id_line, line, seen));
+        }
+        fclose(input);
+    }
+    return ok;
+}
+
+bool load_fa_ids(const char *filename, uint32_t fa_entry_count)
+{
+    fa_id_list = calloc(fa_entry_count, sizeof(struct fa_id_list));
+    id_list_length = fa_entry_count;
+    return IF_(filename, load_fa_ids_file(filename));
+}
+
+
+bool write_fa_ids(int output, const struct filter_mask *archive_mask)
+{
+    bool ok = true;
+    for (uint32_t id = 0; ok  &&  id < id_list_length; id ++)
+    {
+        struct fa_id_list *entry = &fa_id_list[id];
+        bool archived = test_mask_bit(archive_mask, id);
+        if (archived  ||  entry->description)
+        {
+            char *buffer = NULL;
+            ok =
+                TEST_IO(asprintf(&buffer, "%c%u %s %s %s\n",
+                    archived ? '*' : ' ', id,
+                    entry->x_name ?: "X", entry->y_name ?: "Y",
+                    entry->description ?: ""))  &&
+                TEST_write_(
+                    output, buffer, strlen(buffer), "Unable to write response");
+            free(buffer);
+        }
+    }
+    return ok;
 }

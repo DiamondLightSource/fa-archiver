@@ -76,6 +76,9 @@ static bool debug_commands;
 /* Just for reporting with the CE command. */
 static unsigned int events_fa_id;
 
+/* Name annouced to clients for C? command. */
+static const char *server_name;
+
 
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -91,7 +94,7 @@ struct client_info
     struct list_head list;
     struct timespec ts;             // Time client connection completed
     char name[64];                  // Socket address of client
-    char buf[256];                  // Command sent by client
+    char buf[512];                  // Command sent by client
 };
 
 /* Macro for walking lists of client_info structures. */
@@ -159,6 +162,7 @@ static bool __attribute__((format(printf, 2, 3)))
         TEST_write_(
             sock, buffer, strlen(buffer), "Unable to write response");
     free(buffer);
+    va_end(args);
     return ok;
 }
 
@@ -376,7 +380,9 @@ static bool write_status(int scon, const char *client_name)
  *          run state                   1 => Currently fetching data
  *          overrun                     1 => Halted due to buffer overrun
  *  E   Returns event mask FA id or -1 if not specied
+ *  N   Returns server name configured on startup
  *  I   Returns list of all conected clients, one client per line.
+ *  L   Returns list of FA ids and their descriptions
  */
 static bool process_command(int scon, const char *client_name, const char *buf)
 {
@@ -423,6 +429,12 @@ static bool process_command(int scon, const char *client_name, const char *buf)
                 break;
             case 'E':
                 ok = write_string(scon, "%d\n", events_fa_id);
+                break;
+            case 'N':
+                ok = write_string(scon, "%s\n", server_name);
+                break;
+            case 'L':
+                ok = write_fa_ids(scon, &header->archive_mask);
                 break;
             default:
                 ok = report_error(scon, client_name, "Unknown command");
@@ -607,12 +619,13 @@ static int server_socket;
 
 bool initialise_server(
     struct buffer *fa_buffer, struct buffer *decimated,
-    unsigned int _events_fa_id,
+    unsigned int _events_fa_id, const char *_server_name,
     const char *bind_address, int port, bool extra, bool reuseaddr)
 {
     initialise_subscribe(fa_buffer, decimated);
     fa_block_buffer = fa_buffer;
     events_fa_id = _events_fa_id;
+    server_name = _server_name;
     debug_commands = extra;
 
     struct sockaddr_in sin = {

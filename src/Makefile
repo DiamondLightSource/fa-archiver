@@ -19,7 +19,6 @@ CFLAGS += -std=gnu99
 CFLAGS += -O3
 CFLAGS += -g
 
-CFLAGS += -Werror
 CFLAGS += -Wall -Wextra
 CFLAGS += -Wno-unused-parameter
 CFLAGS += -Wno-missing-field-initializers
