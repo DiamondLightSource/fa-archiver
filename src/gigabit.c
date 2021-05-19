@@ -61,7 +61,7 @@
 #define TIMEOUT_NSECS   (1000 * TIMEOUT_USECS)
 
 
-static int gigabit_port;
+static uint16_t gigabit_port;
 static int gigabit_socket;
 static size_t fa_frame_size;
 
@@ -210,7 +210,7 @@ const struct sniffer_context *initialise_gigabit(
     unsigned int fa_entry_count, int port)
 {
     fa_frame_size = fa_entry_count * FA_ENTRY_SIZE;
-    gigabit_port = port;
+    gigabit_port = (uint16_t) port;
 
     log_message("Data capturing from port %d", gigabit_port);
     bool ok =

@@ -93,7 +93,7 @@ bool initialise_header(
 
     /* Header signature. */
     memset(header, 0, sizeof(*header));
-    strncpy(header->signature, DISK_SIGNATURE, sizeof(header->signature));
+    memcpy(header->signature, DISK_SIGNATURE, sizeof(header->signature));
     header->version = DISK_VERSION;
 
     /* Capture parameters. */

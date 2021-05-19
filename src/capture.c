@@ -116,7 +116,7 @@ static bool connect_server(FILE **stream)
     struct sockaddr_in s_in = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = INADDR_ANY,
-        .sin_port = htons(port)
+        .sin_port = htons((uint16_t) port)
     };
     struct hostent *hostent;
     int sock;

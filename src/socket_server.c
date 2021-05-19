@@ -631,7 +631,7 @@ bool initialise_server(
     struct sockaddr_in sin = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = INADDR_ANY,
-        .sin_port = htons(port)
+        .sin_port = htons((uint16_t) port)
     };
     int reuse = 1;
     return
