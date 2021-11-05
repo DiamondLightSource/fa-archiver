@@ -5,6 +5,10 @@ endif
 
 DIST_DIR = $(PYTHON_BUILD_DIR)/dist
 
+PYTHON_SHORT_VERSION = 2.7
+PYTHON_SHORT_VERSION = $(shell \
+    $(PYTHON) --version 2>&1 | grep -oP '(?<=^Python )[^.]*\.[^.]*')
+
 
 # This is run when we type make
 dist: setup.py $(shell find -name \*.py)
@@ -18,6 +22,7 @@ clean:
 
 # Install the built egg and keep track of what was installed
 install: $(DIST_DIR)
+	mkdir -p $(PREFIX)/lib/python$(PYTHON_SHORT_VERSION)/site-packages
 	$(PYTHON) setup.py easy_install -m \
             --record=installed.files \
             --prefix=$(PREFIX) $(DIST_DIR)/*.egg

@@ -6,7 +6,7 @@ endif
 MATLAB_DIR ?= $(PREFIX)/matlab
 
 # Substitutions for fa_zoomer.sh
-MCRROOT ?= /dls_sw/prod/tools/RHEL7-x86_64/matlab/R2019a/prefix
+MCRROOT ?= /dls_sw/prod/tools/RHEL7-x86_64/matlab/R2021a/prefix
 ARCH ?= glnxa64
 
 MCC ?= $(MCRROOT)/bin/mcc
@@ -34,10 +34,10 @@ fa_zoomer: $(MATLAB_FILES) fa_zoomer.sh
 	sed '$(ZOOMER_SUBST)' $(srcdir)/fa_zoomer.sh >$@
 	chmod +x $@_bin $@
 
-install: $(MATLAB_FILES) fa_zoomer
+install: $(MATLAB_FILES)
 	install -d $(MATLAB_DIR)
 	install -m444 $(MATLAB_FILES:%=$(srcdir)/%) $(MATLAB_DIR)
-	install -d $(SCRIPT_DIR)
-	install fa_zoomer fa_zoomer_bin $(SCRIPT_DIR)
+# 	install -d $(SCRIPT_DIR)
+# 	install fa_zoomer fa_zoomer_bin $(SCRIPT_DIR)
 
 .PHONY: default install install_m_files
